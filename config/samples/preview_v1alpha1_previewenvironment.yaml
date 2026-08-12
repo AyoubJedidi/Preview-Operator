@@ -1,0 +1,9 @@
+apiVersion: preview.preview.io/v1alpha1
+kind: PreviewEnvironment
+metadata:
+  labels:
+    app.kubernetes.io/name: preview-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: previewenvironment-sample
+spec:
+  # TODO(user): Add fields here
