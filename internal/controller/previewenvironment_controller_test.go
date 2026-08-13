@@ -21,11 +21,14 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
 )
@@ -64,35 +67,95 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 						GitOps: previewv1alpha1.GitOpsConfig{
 							TargetRevision: "feature/payment-gateway",
 							Path:           "k8s/overlays/preview",
+							HelmValues: map[string]string{
+								"env": "preview",
+								"pr":  "142",
+							},
 						},
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
+
+			By("creating the argocd namespace if not exists")
+			argocdNamespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "argocd",
+				},
+			}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "argocd"}, argocdNamespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, argocdNamespace)).To(Succeed())
+			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &previewv1alpha1.PreviewEnvironment{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+			if err == nil {
+				By("Cleanup the specific resource instance PreviewEnvironment")
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			}
 
-			By("Cleanup the specific resource instance PreviewEnvironment")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "preview-pr-142",
+				},
+			}
+			_ = k8sClient.Delete(ctx, ns)
 		})
+
 		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
+			By("Reconciling the created resource (First loop - phase transitions to Provisioning)")
 			controllerReconciler := &PreviewEnvironmentReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			Expect(result.Requeue).To(BeTrue())
+
+			// Check status is Provisioning
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("Provisioning"))
+
+			By("Reconciling the resource again (Second loop - resource creation)")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check Namespace exists
+			var ns corev1.Namespace
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "preview-pr-142"}, &ns)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check Ingress exists
+			var ingress networkingv1.Ingress
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "pr-142-ingress", Namespace: "preview-pr-142"}, &ingress)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ingress.Spec.Rules[0].Host).To(Equal("pr-142.preview.company.com"))
+
+			// Check ArgoCD Application exists
+			var app unstructured.Unstructured
+			app.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "argoproj.io",
+				Version: "v1alpha1",
+				Kind:    "Application",
+			})
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "pr-142", Namespace: "argocd"}, &app)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check Status was updated to Ready
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("Ready"))
+			Expect(previewenvironment.Status.PreviewURL).To(Equal("https://pr-142.preview.company.com"))
+			Expect(previewenvironment.Status.ArgoAppStatus).To(Equal("Healthy"))
 		})
 	})
 })
