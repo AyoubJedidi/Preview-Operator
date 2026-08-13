@@ -37,6 +37,7 @@ import (
 
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
 	"github.com/AyoubJedidi/preview-operator/internal/controller"
+	githubreceiver "github.com/AyoubJedidi/preview-operator/internal/github"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -55,6 +56,7 @@ func init() {
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
+	var githubWebhookAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
@@ -64,6 +66,8 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&githubWebhookAddr, "github-webhook-bind-address", ":8085",
+		"The address the GitHub webhook receiver endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -185,6 +189,48 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "previewenvironment")
 		os.Exit(1)
 	}
+
+	// GitHub Webhook Receiver Setup
+	githubWebhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	githubToken := os.Getenv("GITHUB_TOKEN")
+	if githubToken == "" {
+		setupLog.Info("WARNING: GITHUB_TOKEN env var is not set. Comments will not be posted to GitHub.")
+	}
+	if githubWebhookSecret == "" {
+		setupLog.Info("WARNING: GITHUB_WEBHOOK_SECRET env var is not set. Incoming signature verification is bypassed.")
+	}
+
+	ghClient := githubreceiver.NewClient(githubToken)
+
+	previewDomain := os.Getenv("PREVIEW_DOMAIN")
+	if previewDomain == "" {
+		previewDomain = "preview.company.com"
+	}
+	gitopsPath := os.Getenv("GITOPS_PATH")
+	if gitopsPath == "" {
+		gitopsPath = "k8s/overlays/preview"
+	}
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	if podNamespace == "" {
+		podNamespace = "preview-operator-system"
+	}
+
+	receiver := &githubreceiver.WebhookReceiver{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		BindAddress:   githubWebhookAddr,
+		WebhookSecret: githubWebhookSecret,
+		GHClient:      ghClient,
+		Domain:        previewDomain,
+		GitopsPath:    gitopsPath,
+		Namespace:     podNamespace,
+	}
+
+	if err := mgr.Add(receiver); err != nil {
+		setupLog.Error(err, "Failed to add GitHub Webhook Receiver to manager")
+		os.Exit(1)
+	}
+
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
