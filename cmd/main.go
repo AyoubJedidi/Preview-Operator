@@ -182,15 +182,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.PreviewEnvironmentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "previewenvironment")
-		os.Exit(1)
-	}
-
-	// GitHub Webhook Receiver Setup
+	// GitHub Client Setup
 	githubWebhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken == "" {
@@ -199,8 +191,28 @@ func main() {
 	if githubWebhookSecret == "" {
 		setupLog.Info("WARNING: GITHUB_WEBHOOK_SECRET env var is not set. Incoming signature verification is bypassed.")
 	}
-
 	ghClient := githubreceiver.NewClient(githubToken)
+
+	// Prometheus Client Setup
+	prometheusAddress := os.Getenv("PROMETHEUS_ADDRESS")
+	if prometheusAddress == "" {
+		prometheusAddress = "http://localhost:9090"
+	}
+	promQuerier, err := controller.NewPrometheusQuerier(prometheusAddress)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize Prometheus client", "address", prometheusAddress)
+		os.Exit(1)
+	}
+
+	if err := (&controller.PreviewEnvironmentReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		GHClient:       ghClient,
+		MetricsQuerier: promQuerier,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "previewenvironment")
+		os.Exit(1)
+	}
 
 	previewDomain := os.Getenv("PREVIEW_DOMAIN")
 	if previewDomain == "" {

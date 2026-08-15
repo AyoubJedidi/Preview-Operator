@@ -33,6 +33,21 @@ import (
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
 )
 
+type MockGitHubClient struct {
+	LastComment string
+	Owner       string
+	Repo        string
+	PRNumber    int
+}
+
+func (m *MockGitHubClient) PostPRComment(ctx context.Context, owner, repo string, prNumber int, comment string) error {
+	m.LastComment = comment
+	m.Owner = owner
+	m.Repo = repo
+	m.PRNumber = prNumber
+	return nil
+}
+
 var _ = Describe("PreviewEnvironment Controller", func() {
 	Context("When reconciling a resource", func() {
 		const (
@@ -105,11 +120,20 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			_ = k8sClient.Delete(ctx, ns)
 		})
 
-		It("should successfully reconcile the resource", func() {
+		It("should successfully reconcile the resource through provisioning, health evaluating, ready, degraded, and revision change reset", func() {
 			By("Reconciling the created resource (First loop - phase transitions to Provisioning)")
+			mockMetrics := &MockMetricsQuerier{
+				P99Latency: 150.0,
+				ErrorRate:  0.2,
+				Restarts:   0,
+			}
+			mockGH := &MockGitHubClient{}
+
 			controllerReconciler := &PreviewEnvironmentReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:         k8sClient,
+				Scheme:         k8sClient.Scheme(),
+				GHClient:       mockGH,
+				MetricsQuerier: mockMetrics,
 			}
 
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -123,11 +147,17 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(previewenvironment.Status.Phase).To(Equal("Provisioning"))
 
-			By("Reconciling the resource again (Second loop - resource creation)")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+			By("Reconciling the resource again (Second loop - resource creation -> HealthEvaluating)")
+			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Requeue).To(BeTrue())
+
+			// Check status is HealthEvaluating
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("HealthEvaluating"))
 
 			// Check Namespace exists
 			var ns corev1.Namespace
@@ -150,12 +180,64 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: "pr-142", Namespace: "argocd"}, &app)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Check Status was updated to Ready
+			By("Reconciling the resource again (Third loop - SRE metrics evaluation: Passing -> Ready)")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check Status was updated to Ready and metrics snapshot set
 			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(previewenvironment.Status.Phase).To(Equal("Ready"))
 			Expect(previewenvironment.Status.PreviewURL).To(Equal("https://pr-142.preview.company.com"))
-			Expect(previewenvironment.Status.ArgoAppStatus).To(Equal("Healthy"))
+			Expect(previewenvironment.Status.SREMetrics.CurrentP99LatencyMs).To(Equal(150.0))
+			Expect(previewenvironment.Status.SREMetrics.CurrentErrorRatePercent).To(Equal(0.2))
+			Expect(previewenvironment.Status.SREMetrics.CurrentPodRestarts).To(Equal(0))
+
+			// Verify GitHub comment was posted for Ready phase
+			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment is Ready!"))
+			Expect(mockGH.LastComment).To(ContainSubstring("150.0ms"))
+
+			By("Reconciling the resource again with failing metrics (SRE metrics evaluation: Failing -> Degraded)")
+			mockMetrics.P99Latency = 450.0 // Threshold is 300ms
+			mockMetrics.ErrorRate = 2.5    // Threshold is 1.0%
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check Status was updated to Degraded and metrics snapshot set
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("Degraded"))
+			Expect(previewenvironment.Status.SREMetrics.CurrentP99LatencyMs).To(Equal(450.0))
+			Expect(previewenvironment.Status.SREMetrics.CurrentErrorRatePercent).To(Equal(2.5))
+
+			// Verify GitHub comment was posted for Degraded phase
+			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment is Degraded"))
+			Expect(mockGH.LastComment).To(ContainSubstring("High P99 Latency"))
+			Expect(mockGH.LastComment).To(ContainSubstring("450.0ms"))
+
+			By("Reconciling the resource again with updated GitOps TargetRevision (synchronize/new commit -> Reset to Provisioning)")
+			// Get current CR, modify, and update
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			previewenvironment.Spec.GitOps.TargetRevision = "feature/payment-gateway-updated"
+			err = k8sClient.Update(ctx, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+
+			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Requeue).To(BeTrue())
+
+			// Verify phase was reset to Provisioning
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("Provisioning"))
 		})
 	})
 })

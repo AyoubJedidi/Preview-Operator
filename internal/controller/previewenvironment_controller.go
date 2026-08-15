@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -37,10 +38,17 @@ import (
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
 )
 
+// GitHubClient defines the interface for posting PR comments.
+type GitHubClient interface {
+	PostPRComment(ctx context.Context, owner, repo string, prNumber int, comment string) error
+}
+
 // PreviewEnvironmentReconciler reconciles a PreviewEnvironment object
 type PreviewEnvironmentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme         *runtime.Scheme
+	GHClient       GitHubClient
+	MetricsQuerier MetricsQuerier
 }
 
 // +kubebuilder:rbac:groups=preview.preview.io,resources=previewenvironments,verbs=get;list;watch;create;update;patch;delete
@@ -252,26 +260,216 @@ func (r *PreviewEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.R
 			return ctrl.Result{}, err
 		}
 	} else {
+		var revisionChanged bool
+		if existingSpec, ok := existingApp.Object["spec"].(map[string]interface{}); ok {
+			if source, ok := existingSpec["source"].(map[string]interface{}); ok {
+				if existingRevision, ok := source["targetRevision"].(string); ok {
+					if existingRevision != env.Spec.GitOps.TargetRevision {
+						revisionChanged = true
+					}
+				}
+			}
+		}
+
 		existingApp.Object["spec"] = appSpec
 		if err := r.Update(ctx, &existingApp); err != nil {
 			log.Error(err, "Failed to update ArgoCD Application", "name", appName, "namespace", argoNamespace)
 			return ctrl.Result{}, err
 		}
+
+		if revisionChanged {
+			log.Info("Detected new revision, resetting phase to Provisioning", "name", appName, "targetRevision", env.Spec.GitOps.TargetRevision)
+			env.Status.Phase = "Provisioning"
+			env.Status.ArgoAppStatus = "Progressing"
+			if err := r.Status().Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to reset phase to Provisioning on new commit")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// 6. Update Status
-	if env.Status.Phase != "Ready" || env.Status.PreviewURL == "" || env.Status.ArgoAppStatus != "Healthy" {
-		env.Status.Phase = "Ready"
-		env.Status.PreviewURL = fmt.Sprintf("https://%s", hostName)
-		env.Status.ArgoAppStatus = "Healthy"
-		if err := r.Status().Update(ctx, &env); err != nil {
-			log.Error(err, "Failed to update PreviewEnvironment Status")
+	if env.Status.Phase == "Provisioning" {
+		var latestApp unstructured.Unstructured
+		latestApp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "argoproj.io",
+			Version: "v1alpha1",
+			Kind:    "Application",
+		})
+		err = r.Get(ctx, types.NamespacedName{Name: appName, Namespace: argoNamespace}, &latestApp)
+		if err != nil {
+			log.Error(err, "Failed to fetch latest ArgoCD Application status")
 			return ctrl.Result{}, err
 		}
-		log.Info("Reconciliation successful; Status updated to Ready", "name", env.Name)
+
+		syncStatus, _, _ := unstructured.NestedString(latestApp.Object, "status", "sync", "status")
+		healthStatus, _, _ := unstructured.NestedString(latestApp.Object, "status", "health", "status")
+
+		if syncStatus == "" {
+			syncStatus = "Synced"
+		}
+		if healthStatus == "" {
+			healthStatus = "Healthy"
+		}
+
+		env.Status.ArgoAppStatus = healthStatus
+
+		if syncStatus == "Synced" && healthStatus == "Healthy" {
+			env.Status.Phase = "HealthEvaluating"
+			if err := r.Status().Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to update phase to HealthEvaluating")
+				return ctrl.Result{}, err
+			}
+			log.Info("ArgoCD Application is synced and healthy, transitioning to HealthEvaluating", "name", env.Name)
+			return ctrl.Result{Requeue: true}, nil
+		} else {
+			if err := r.Status().Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to update ArgoAppStatus in status")
+				return ctrl.Result{}, err
+			}
+			log.Info("Waiting for ArgoCD Application to become Synced and Healthy", "name", env.Name, "sync", syncStatus, "health", healthStatus)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
+	if env.Status.Phase == "HealthEvaluating" || env.Status.Phase == "Ready" || env.Status.Phase == "Degraded" {
+		if env.Status.PreviewURL == "" {
+			env.Status.PreviewURL = fmt.Sprintf("https://%s", hostName)
+		}
+
+		policy := getHealthPolicy(&env)
+		var latency float64
+		var errorRate float64
+		var restarts int
+		var queryErr error
+
+		if r.MetricsQuerier != nil {
+			latency, queryErr = r.MetricsQuerier.QueryP99Latency(ctx, targetNamespace, policy.EvaluationWindow)
+			if queryErr == nil {
+				errorRate, queryErr = r.MetricsQuerier.QueryErrorRate(ctx, targetNamespace, policy.EvaluationWindow)
+			}
+			if queryErr == nil {
+				restarts, queryErr = r.MetricsQuerier.QueryPodRestarts(ctx, targetNamespace)
+			}
+		}
+
+		if queryErr != nil {
+			log.Error(queryErr, "Failed to query SRE metrics from Prometheus")
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		}
+
+		latencyPassed := latency <= float64(policy.MaxP99LatencyMs)
+		errorRatePassed := errorRate <= policy.MaxErrorRatePercent
+		restartsPassed := restarts <= policy.MaxPodRestarts
+
+		isHealthy := latencyPassed && errorRatePassed && restartsPassed
+
+		oldPhase := env.Status.Phase
+		var newPhase string
+		if isHealthy {
+			newPhase = "Ready"
+		} else {
+			newPhase = "Degraded"
+		}
+
+		env.Status.SREMetrics = previewv1alpha1.SREMetricsSnapshot{
+			CurrentErrorRatePercent: errorRate,
+			CurrentP99LatencyMs:     latency,
+			CurrentPodRestarts:      restarts,
+			LastEvaluatedAt:         time.Now().Format(time.RFC3339),
+		}
+
+		phaseChanged := oldPhase != newPhase
+
+		if phaseChanged {
+			env.Status.Phase = newPhase
+			if err := r.Status().Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to update PreviewEnvironment Phase & Metrics")
+				return ctrl.Result{}, err
+			}
+			log.Info("Phase transitioned", "old", oldPhase, "new", newPhase, "name", env.Name)
+
+			if r.GHClient != nil {
+				var comment string
+				if isHealthy {
+					comment = fmt.Sprintf("### 🚀 Preview Environment is Ready!\n\n"+
+						"**URL**: [%s](%s)\n"+
+						"**Status**: Green/Healthy\n\n"+
+						"#### 📊 SRE Golden Signals Health Gating Snapshot\n"+
+						"- **P99 Latency**: `%.1fms` (Threshold: `<%dms`)\n"+
+						"- **HTTP 5xx Error Rate**: `%.2f%%` (Threshold: `<%.2f%%`)\n"+
+						"- **Container Restarts**: `%d` (Threshold: `%d`)",
+						env.Status.PreviewURL, env.Status.PreviewURL,
+						latency, policy.MaxP99LatencyMs,
+						errorRate, policy.MaxErrorRatePercent,
+						restarts, policy.MaxPodRestarts)
+				} else {
+					var violations []string
+					if !latencyPassed {
+						violations = append(violations, fmt.Sprintf("High P99 Latency: `%.1fms` (threshold: `%dms`)", latency, policy.MaxP99LatencyMs))
+					}
+					if !errorRatePassed {
+						violations = append(violations, fmt.Sprintf("High HTTP 5xx Error Rate: `%.2f%%` (threshold: `%.2f%%`)", errorRate, policy.MaxErrorRatePercent))
+					}
+					if !restartsPassed {
+						violations = append(violations, fmt.Sprintf("High Container Restarts: `%d` (threshold: `%d`)", restarts, policy.MaxPodRestarts))
+					}
+
+					comment = fmt.Sprintf("### ⚠️ Preview Environment is Degraded\n\n"+
+						"**URL**: [%s](%s)\n"+
+						"**Status**: Red/Degraded\n\n"+
+						"#### ❌ Violations:\n- %s\n\n"+
+						"#### 📊 SRE Golden Signals Health Gating Snapshot\n"+
+						"- **P99 Latency**: `%.1fms` %s\n"+
+						"- **HTTP 5xx Error Rate**: `%.2f%%` %s\n"+
+						"- **Container Restarts**: `%d` %s",
+						env.Status.PreviewURL, env.Status.PreviewURL,
+						strings.Join(violations, "\n- "),
+						latency, checkMark(!latencyPassed),
+						errorRate, checkMark(!errorRatePassed),
+						restarts, checkMark(!restartsPassed))
+				}
+
+				if err := r.GHClient.PostPRComment(ctx, env.Spec.RepoOwner, env.Spec.RepoName, env.Spec.PRNumber, comment); err != nil {
+					log.Error(err, "Failed to post SRE metrics status comment to GitHub")
+				} else {
+					log.Info("Successfully posted SRE metrics comment to GitHub", "pr", env.Spec.PRNumber)
+				}
+			}
+
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		} else {
+			if err := r.Status().Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to update SRE metrics snapshot in status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func getHealthPolicy(env *previewv1alpha1.PreviewEnvironment) previewv1alpha1.HealthPolicyConfig {
+	policy := env.Spec.HealthPolicy
+	if policy.EvaluationWindow == "" {
+		policy.EvaluationWindow = "3m"
+	}
+	if policy.MaxErrorRatePercent == 0 {
+		policy.MaxErrorRatePercent = 1.0
+	}
+	if policy.MaxP99LatencyMs == 0 {
+		policy.MaxP99LatencyMs = 300
+	}
+	return policy
+}
+
+func checkMark(failed bool) string {
+	if failed {
+		return "❌"
+	}
+	return "✅"
 }
 
 // SetupWithManager sets up the controller with the Manager.

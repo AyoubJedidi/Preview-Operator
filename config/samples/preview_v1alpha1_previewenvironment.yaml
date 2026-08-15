@@ -4,6 +4,30 @@ metadata:
   labels:
     app.kubernetes.io/name: preview-operator
     app.kubernetes.io/managed-by: kustomize
-  name: previewenvironment-sample
+  name: pr-142
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  prNumber: 142
+  repoOwner: AyoubJedidi
+  repoName: preview-operator # We can point to this operator repo or a dummy repo for testing
+  branch: main
+  commitSha: "7a8b9c0"
+  domain: preview.company.com
+  
+  gitops:
+    targetRevision: main
+    path: config/crd/bases
+    helmValues:
+      env: preview
+      pr: "142"
+
+  healthPolicy:
+    evaluationWindow: "3m"
+    maxErrorRatePercent: 1.0       # Max 1% HTTP 5xx errors
+    maxP99LatencyMs: 300          # Max 300ms latency
+    maxPodRestarts: 0             # Zero container restarts allowed
+
+  finops:
+    autoHibernate: true
+    idleDuration: "2h"
+
