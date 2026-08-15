@@ -123,9 +123,10 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 		It("should successfully reconcile the resource through provisioning, health evaluating, ready, degraded, and revision change reset", func() {
 			By("Reconciling the created resource (First loop - phase transitions to Provisioning)")
 			mockMetrics := &MockMetricsQuerier{
-				P99Latency: 150.0,
-				ErrorRate:  0.2,
-				Restarts:   0,
+				P99Latency:    150.0,
+				ErrorRate:     0.2,
+				Restarts:      0,
+				TotalRequests: 100.0,
 			}
 			mockGH := &MockGitHubClient{}
 
@@ -238,6 +239,64 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(previewenvironment.Status.Phase).To(Equal("Provisioning"))
+		})
+
+		It("should successfully hibernate when idle and wake up when requested", func() {
+			mockMetrics := &MockMetricsQuerier{
+				P99Latency:    100.0,
+				ErrorRate:     0.0,
+				Restarts:      0,
+				TotalRequests: 100.0, // Initial traffic
+			}
+			mockGH := &MockGitHubClient{}
+
+			controllerReconciler := &PreviewEnvironmentReconciler{
+				Client:         k8sClient,
+				Scheme:         k8sClient.Scheme(),
+				GHClient:       mockGH,
+				MetricsQuerier: mockMetrics,
+			}
+
+			req := reconcile.Request{NamespacedName: typeNamespacedName}
+
+			// 1. Move CR through Provisioning -> HealthEvaluating -> Ready
+			Eventually(func(g Gomega) string {
+				_, _ = controllerReconciler.Reconcile(ctx, req)
+				var currentEnv previewv1alpha1.PreviewEnvironment
+				g.Expect(k8sClient.Get(ctx, typeNamespacedName, &currentEnv)).To(Succeed())
+				return currentEnv.Status.Phase
+			}, "5s", "100ms").Should(Equal("Ready"))
+
+			// 2. Set TotalRequests to 0 to simulate idle traffic
+			mockMetrics.TotalRequests = 0.0
+
+			_, err := controllerReconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(previewenvironment.Status.Phase).To(Equal("Hibernating"))
+			Expect(previewenvironment.Status.Hibernation.IsHibernating).To(BeTrue())
+			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment Hibernated"))
+
+			// 3. Trigger Wakeup by resuming traffic and updating status.hibernation.isHibernating = false
+			mockMetrics.TotalRequests = 100.0
+			err = k8sClient.Get(ctx, typeNamespacedName, previewenvironment)
+			Expect(err).NotTo(HaveOccurred())
+			previewenvironment.Status.Hibernation.IsHibernating = false
+			Expect(k8sClient.Status().Update(ctx, previewenvironment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) string {
+				_, _ = controllerReconciler.Reconcile(ctx, req)
+				var currentEnv previewv1alpha1.PreviewEnvironment
+				g.Expect(k8sClient.Get(ctx, typeNamespacedName, &currentEnv)).To(Succeed())
+				return currentEnv.Status.Phase
+			}, "5s", "100ms").Should(Equal("Ready"))
+			Expect(previewenvironment.Status.Hibernation.IsHibernating).To(BeFalse())
+			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment Woken Up!"))
 		})
 	})
 })

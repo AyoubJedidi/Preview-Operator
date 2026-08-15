@@ -32,6 +32,7 @@ type MetricsQuerier interface {
 	QueryP99Latency(ctx context.Context, namespace string, window string) (float64, error)
 	QueryErrorRate(ctx context.Context, namespace string, window string) (float64, error)
 	QueryPodRestarts(ctx context.Context, namespace string) (int, error)
+	QueryTotalRequests(ctx context.Context, namespace string, window string) (float64, error)
 }
 
 // PrometheusQuerier is the real implementation of MetricsQuerier using the Prometheus API.
@@ -83,6 +84,16 @@ func (p *PrometheusQuerier) QueryPodRestarts(ctx context.Context, namespace stri
 	return int(val), nil
 }
 
+// QueryTotalRequests queries the total count of HTTP requests over the given window.
+func (p *PrometheusQuerier) QueryTotalRequests(ctx context.Context, namespace string, window string) (float64, error) {
+	query := fmt.Sprintf("sum(increase(http_requests_total{namespace=\"%s\"}[%s]))", namespace, window)
+	val, err := p.querySingleValue(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query total requests: %w", err)
+	}
+	return val, nil
+}
+
 func (p *PrometheusQuerier) querySingleValue(ctx context.Context, query string) (float64, error) {
 	result, _, err := p.api.Query(ctx, query, time.Now())
 	if err != nil {
@@ -108,10 +119,11 @@ func (p *PrometheusQuerier) querySingleValue(ctx context.Context, query string) 
 
 // MockMetricsQuerier is a mock implementation of MetricsQuerier for testing.
 type MockMetricsQuerier struct {
-	P99Latency float64
-	ErrorRate  float64
-	Restarts   int
-	Err        error
+	P99Latency    float64
+	ErrorRate     float64
+	Restarts      int
+	TotalRequests float64
+	Err           error
 }
 
 func (m *MockMetricsQuerier) QueryP99Latency(ctx context.Context, namespace string, window string) (float64, error) {
@@ -124,4 +136,8 @@ func (m *MockMetricsQuerier) QueryErrorRate(ctx context.Context, namespace strin
 
 func (m *MockMetricsQuerier) QueryPodRestarts(ctx context.Context, namespace string) (int, error) {
 	return m.Restarts, m.Err
+}
+
+func (m *MockMetricsQuerier) QueryTotalRequests(ctx context.Context, namespace string, window string) (float64, error) {
+	return m.TotalRequests, m.Err
 }

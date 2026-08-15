@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -57,6 +58,7 @@ type PreviewEnvironmentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -333,6 +335,21 @@ func (r *PreviewEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
+	// 6. FinOps Hibernating Check (Top-Level)
+	if env.Status.Phase == "Hibernating" || env.Status.Hibernation.IsHibernating {
+		// If wake-up triggered (manually setting isHibernating: false while phase is Hibernating)
+		if !env.Status.Hibernation.IsHibernating && env.Status.Phase == "Hibernating" {
+			log.Info("Wakeup triggered for hibernated environment", "name", env.Name)
+			if err := r.wakeEnvironment(ctx, targetNamespace, &env); err != nil {
+				log.Error(err, "Failed to wake up environment")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		// Maintain hibernating state
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	}
+
 	if env.Status.Phase == "HealthEvaluating" || env.Status.Phase == "Ready" || env.Status.Phase == "Degraded" {
 		if env.Status.PreviewURL == "" {
 			env.Status.PreviewURL = fmt.Sprintf("https://%s", hostName)
@@ -437,18 +454,179 @@ func (r *PreviewEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.R
 					log.Info("Successfully posted SRE metrics comment to GitHub", "pr", env.Spec.PRNumber)
 				}
 			}
-
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		} else {
 			if err := r.Status().Update(ctx, &env); err != nil {
 				log.Error(err, "Failed to update SRE metrics snapshot in status")
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
+
+		// 7. FinOps Auto-Hibernation Trigger
+		if (env.Status.Phase == "Ready" || env.Status.Phase == "Degraded") && env.Spec.FinOps.AutoHibernate {
+			shouldHibernate := env.Status.Hibernation.IsHibernating
+			if !shouldHibernate && r.MetricsQuerier != nil {
+				idleWindow := env.Spec.FinOps.IdleDuration
+				if idleWindow == "" {
+					idleWindow = "2h"
+				}
+				totalReqs, err := r.MetricsQuerier.QueryTotalRequests(ctx, targetNamespace, idleWindow)
+				if err == nil && totalReqs == 0 {
+					log.Info("No traffic detected over idle duration, triggering auto-hibernation", "name", env.Name, "idleDuration", idleWindow)
+					shouldHibernate = true
+				}
+			}
+
+			if shouldHibernate {
+				if err := r.hibernateEnvironment(ctx, targetNamespace, &env); err != nil {
+					log.Error(err, "Failed to hibernate environment")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+			}
+		}
+
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *PreviewEnvironmentReconciler) hibernateEnvironment(ctx context.Context, namespace string, env *previewv1alpha1.PreviewEnvironment) error {
+	log := logf.FromContext(ctx)
+
+	savedReplicas := make(map[string]int32)
+
+	// 1. Scale Deployments
+	var depList appsv1.DeploymentList
+	if err := r.List(ctx, &depList, client.InNamespace(namespace)); err == nil {
+		for i := range depList.Items {
+			dep := &depList.Items[i]
+			if dep.Spec.Replicas != nil && *dep.Spec.Replicas > 0 {
+				savedReplicas[dep.Name] = *dep.Spec.Replicas
+				dep.Spec.Replicas = ptrInt32(0)
+				if err := r.Update(ctx, dep); err != nil {
+					log.Error(err, "Failed to scale down Deployment for hibernation", "name", dep.Name)
+				}
+			}
+		}
+	}
+
+	// 2. Scale StatefulSets
+	var stsList appsv1.StatefulSetList
+	if err := r.List(ctx, &stsList, client.InNamespace(namespace)); err == nil {
+		for i := range stsList.Items {
+			sts := &stsList.Items[i]
+			if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
+				savedReplicas[sts.Name] = *sts.Spec.Replicas
+				sts.Spec.Replicas = ptrInt32(0)
+				if err := r.Update(ctx, sts); err != nil {
+					log.Error(err, "Failed to scale down StatefulSet for hibernation", "name", sts.Name)
+				}
+			}
+		}
+	}
+
+	var latestEnv previewv1alpha1.PreviewEnvironment
+	if err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &latestEnv); err != nil {
+		return fmt.Errorf("failed to re-fetch PreviewEnvironment before status update: %w", err)
+	}
+
+	latestEnv.Status.Phase = "Hibernating"
+	latestEnv.Status.Hibernation = previewv1alpha1.HibernationState{
+		IsHibernating: true,
+		SavedReplicas: savedReplicas,
+		LastActiveAt:  time.Now().Format(time.RFC3339),
+	}
+
+	if err := r.Status().Update(ctx, &latestEnv); err != nil {
+		return fmt.Errorf("failed to update status to Hibernating: %w", err)
+	}
+	*env = latestEnv
+
+	log.Info("Successfully hibernated environment", "name", env.Name, "namespace", namespace)
+
+	if r.GHClient != nil {
+		comment := fmt.Sprintf("### 💤 Preview Environment Hibernated\n\n"+
+			"Workloads in namespace `%s` have been scaled to **0 replicas** to save cloud compute costs due to inactivity.\n\n"+
+			"- **Idle Duration**: `%s`\n"+
+			"- **Status**: Hibernating 💤\n"+
+			"- **Saved Workloads**: `%d`",
+			namespace, env.Spec.FinOps.IdleDuration, len(savedReplicas))
+		_ = r.GHClient.PostPRComment(ctx, env.Spec.RepoOwner, env.Spec.RepoName, env.Spec.PRNumber, comment)
+	}
+
+	return nil
+}
+
+func (r *PreviewEnvironmentReconciler) wakeEnvironment(ctx context.Context, namespace string, env *previewv1alpha1.PreviewEnvironment) error {
+	log := logf.FromContext(ctx)
+
+	savedMap := env.Status.Hibernation.SavedReplicas
+	if savedMap == nil {
+		savedMap = make(map[string]int32)
+	}
+
+	// 1. Restore Deployments
+	var depList appsv1.DeploymentList
+	if err := r.List(ctx, &depList, client.InNamespace(namespace)); err == nil {
+		for i := range depList.Items {
+			dep := &depList.Items[i]
+			targetReplicas := int32(1)
+			if original, exists := savedMap[dep.Name]; exists && original > 0 {
+				targetReplicas = original
+			}
+			dep.Spec.Replicas = ptrInt32(targetReplicas)
+			if err := r.Update(ctx, dep); err != nil {
+				log.Error(err, "Failed to restore Deployment replicas", "name", dep.Name)
+			}
+		}
+	}
+
+	// 2. Restore StatefulSets
+	var stsList appsv1.StatefulSetList
+	if err := r.List(ctx, &stsList, client.InNamespace(namespace)); err == nil {
+		for i := range stsList.Items {
+			sts := &stsList.Items[i]
+			targetReplicas := int32(1)
+			if original, exists := savedMap[sts.Name]; exists && original > 0 {
+				targetReplicas = original
+			}
+			sts.Spec.Replicas = ptrInt32(targetReplicas)
+			if err := r.Update(ctx, sts); err != nil {
+				log.Error(err, "Failed to restore StatefulSet replicas", "name", sts.Name)
+			}
+		}
+	}
+
+	var latestEnv previewv1alpha1.PreviewEnvironment
+	if err := r.Get(ctx, types.NamespacedName{Name: env.Name, Namespace: env.Namespace}, &latestEnv); err != nil {
+		return fmt.Errorf("failed to re-fetch PreviewEnvironment before status update: %w", err)
+	}
+
+	latestEnv.Status.Phase = "Ready"
+	latestEnv.Status.Hibernation.IsHibernating = false
+
+	if err := r.Status().Update(ctx, &latestEnv); err != nil {
+		return fmt.Errorf("failed to update status to Ready after wakeup: %w", err)
+	}
+	*env = latestEnv
+
+	log.Info("Successfully woken up environment", "name", env.Name, "namespace", namespace)
+
+	if r.GHClient != nil {
+		comment := fmt.Sprintf("### ⚡ Preview Environment Woken Up!\n\n"+
+			"The preview workloads have been restored and scaled back to active replicas.\n\n"+
+			"- **URL**: [%s](%s)\n"+
+			"- **Status**: Active ⚡",
+			env.Status.PreviewURL, env.Status.PreviewURL)
+		_ = r.GHClient.PostPRComment(ctx, env.Spec.RepoOwner, env.Spec.RepoName, env.Spec.PRNumber, comment)
+	}
+
+	return nil
+}
+
+func ptrInt32(v int32) *int32 {
+	return &v
 }
 
 func getHealthPolicy(env *previewv1alpha1.PreviewEnvironment) previewv1alpha1.HealthPolicyConfig {

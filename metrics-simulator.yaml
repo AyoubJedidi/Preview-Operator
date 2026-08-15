@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-data
+  namespace: preview-pr-142
+data:
+  metrics: |
+    # HELP http_requests_total Total number of HTTP requests
+    # TYPE http_requests_total counter
+    http_requests_total{status="200"} 100
+    http_requests_total{status="500"} 50
+    # HELP http_request_duration_seconds HTTP request duration in seconds
+    # TYPE http_request_duration_seconds histogram
+    http_request_duration_seconds_bucket{le="0.1"} 10
+    http_request_duration_seconds_bucket{le="0.2"} 20
+    http_request_duration_seconds_bucket{le="0.3"} 30
+    http_request_duration_seconds_bucket{le="+Inf"} 150
+    http_request_duration_seconds_count 150
+    http_request_duration_seconds_sum 45.0
+    # HELP kube_pod_container_status_restarts_total Cumulative container restarts
+    # TYPE kube_pod_container_status_restarts_total counter
+    kube_pod_container_status_restarts_total{container="web"} 0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metrics-simulator
+  namespace: preview-pr-142
+  labels:
+    app: metrics-simulator
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  containers:
+  - name: web
+    image: busybox
+    command: ["sh", "-c", "mkdir -p /www && cp /config/metrics /www/metrics && httpd -f -p 8080 -h /www"]
+    ports:
+    - containerPort: 8080
+    volumeMounts:
+    - name: config-volume
+      mountPath: /config
+  volumes:
+  - name: config-volume
+    configMap:
+      name: metrics-data
