@@ -143,17 +143,6 @@ make test-e2e
 
 ---
 
-## 💼 Resume & Portfolio Highlights
-
-> **PreviewOperator — Go-Based Kubernetes Operator for GitOps Preview Environments**
-> * **Tech Stack**: Go (Golang), Kubernetes `controller-runtime` / `kubebuilder`, ArgoCD API, Prometheus PromQL, GitHub Webhooks API, Helm, Kind.
-> * Authored a production-grade **Go Kubernetes Operator** managing PR preview environment lifecycles integrated with **ArgoCD** GitOps applications.
-> * Implemented **SRE Health Gating**: Integrated a Prometheus PromQL engine querying P99 latency, 5xx error rates, and crash loops to prevent broken deployments from being marked ready.
-> * Built a **FinOps Auto-Hibernation Engine** that scales idle workloads to zero after configurable inactivity windows, reducing preview environment cloud costs by over **65%**.
-> * Engineered zero-downtime lifecycle teardown using Kubernetes finalizers to automatically delete ArgoCD applications, namespaces, ingress, TLS certificates, and PVCs upon PR closure.
 
 ---
 
-## 📄 License
-
-Copyright 2026. Licensed under the [Apache License, Version 2.0](LICENSE).
