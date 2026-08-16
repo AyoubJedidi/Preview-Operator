@@ -1,0 +1,20 @@
+apiVersion: v2
+name: preview-operator
+description: Helm chart for deploying PreviewOperator - Go-based Kubernetes Operator for GitOps PR Preview Environments
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - kubernetes
+  - operator
+  - preview-environment
+  - gitops
+  - argocd
+  - prometheus
+  - sre
+  - finops
+home: https://github.com/AyoubJedidi/preview-operator
+sources:
+  - https://github.com/AyoubJedidi/preview-operator
+maintainers:
+  - name: AyoubJedidi

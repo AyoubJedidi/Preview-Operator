@@ -1,0 +1,52 @@
+# Default values for preview-operator.
+
+replicaCount: 1
+
+image:
+  repository: preview-operator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: "preview-operator-controller-manager"
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8443
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Operator Specific Configurations
+config:
+  prometheusURL: "http://prometheus-k8s.monitoring.svc:9090"
+  githubSecret: "preview-operator-github-secret"
+  argocdNamespace: "argocd"
