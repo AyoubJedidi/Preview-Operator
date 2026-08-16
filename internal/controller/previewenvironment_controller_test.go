@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
@@ -109,7 +110,11 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			if err == nil {
 				By("Cleanup the specific resource instance PreviewEnvironment")
-				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				if controllerutil.ContainsFinalizer(resource, "preview.preview.io/finalizer") {
+					controllerutil.RemoveFinalizer(resource, "preview.preview.io/finalizer")
+					_ = k8sClient.Update(ctx, resource)
+				}
+				_ = k8sClient.Delete(ctx, resource)
 			}
 
 			ns := &corev1.Namespace{
@@ -297,6 +302,43 @@ var _ = Describe("PreviewEnvironment Controller", func() {
 			}, "5s", "100ms").Should(Equal("Ready"))
 			Expect(previewenvironment.Status.Hibernation.IsHibernating).To(BeFalse())
 			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment Woken Up!"))
+		})
+
+		It("should register finalizer on reconciliation and teardown resources when deleted", func() {
+			mockMetrics := &MockMetricsQuerier{}
+			mockGH := &MockGitHubClient{}
+
+			controllerReconciler := &PreviewEnvironmentReconciler{
+				Client:         k8sClient,
+				Scheme:         k8sClient.Scheme(),
+				GHClient:       mockGH,
+				MetricsQuerier: mockMetrics,
+			}
+
+			req := reconcile.Request{NamespacedName: typeNamespacedName}
+
+			// 1. Reconcile to register finalizer
+			result, err := controllerReconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Requeue).To(BeTrue())
+
+			var currentEnv previewv1alpha1.PreviewEnvironment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &currentEnv)).To(Succeed())
+			Expect(currentEnv.Finalizers).To(ContainElement("preview.preview.io/finalizer"))
+
+			// 2. Mark for deletion
+			Expect(k8sClient.Delete(ctx, &currentEnv)).To(Succeed())
+
+			// 3. Reconcile deletion
+			_, err = controllerReconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// 4. Verify cleanup GitHub comment posted
+			Expect(mockGH.LastComment).To(ContainSubstring("Preview Environment Cleanup Complete"))
+
+			// 5. Verify CR was removed (NotFound)
+			err = k8sClient.Get(ctx, typeNamespacedName, &currentEnv)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 })

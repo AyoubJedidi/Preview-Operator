@@ -34,10 +34,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	previewv1alpha1 "github.com/AyoubJedidi/preview-operator/api/v1alpha1"
 )
+
+const previewEnvironmentFinalizer = "preview.preview.io/finalizer"
 
 // GitHubClient defines the interface for posting PR comments.
 type GitHubClient interface {
@@ -73,6 +76,31 @@ func (r *PreviewEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 		log.Error(err, "Failed to get PreviewEnvironment")
 		return ctrl.Result{}, err
+	}
+
+	// Check if the PreviewEnvironment instance is marked to be deleted
+	if !env.ObjectMeta.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&env, previewEnvironmentFinalizer) {
+			if err := r.finalizePreviewEnvironment(ctx, &env); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(&env, previewEnvironmentFinalizer)
+			if err := r.Update(ctx, &env); err != nil {
+				log.Error(err, "Failed to remove finalizer from PreviewEnvironment")
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Add finalizer for this CR if it doesn't already have one
+	if !controllerutil.ContainsFinalizer(&env, previewEnvironmentFinalizer) {
+		controllerutil.AddFinalizer(&env, previewEnvironmentFinalizer)
+		if err := r.Update(ctx, &env); err != nil {
+			log.Error(err, "Failed to add finalizer to PreviewEnvironment")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 2. Set phase to Provisioning if it's Pending/new
@@ -620,6 +648,61 @@ func (r *PreviewEnvironmentReconciler) wakeEnvironment(ctx context.Context, name
 			"- **Status**: Active ⚡",
 			env.Status.PreviewURL, env.Status.PreviewURL)
 		_ = r.GHClient.PostPRComment(ctx, env.Spec.RepoOwner, env.Spec.RepoName, env.Spec.PRNumber, comment)
+	}
+
+	return nil
+}
+
+func (r *PreviewEnvironmentReconciler) finalizePreviewEnvironment(ctx context.Context, env *previewv1alpha1.PreviewEnvironment) error {
+	log := logf.FromContext(ctx)
+
+	targetNamespace := fmt.Sprintf("preview-pr-%d", env.Spec.PRNumber)
+	argoNamespace := os.Getenv("ARGOCD_NAMESPACE")
+	if argoNamespace == "" {
+		argoNamespace = "argocd"
+	}
+	appName := fmt.Sprintf("pr-%d", env.Spec.PRNumber)
+
+	// 1. Delete ArgoCD Application
+	app := &unstructured.Unstructured{}
+	app.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "argoproj.io",
+		Version: "v1alpha1",
+		Kind:    "Application",
+	})
+	app.SetName(appName)
+	app.SetNamespace(argoNamespace)
+
+	if err := r.Delete(ctx, app); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to delete ArgoCD Application during finalization", "name", appName, "namespace", argoNamespace)
+		return err
+	}
+	log.Info("Successfully deleted ArgoCD Application during finalization", "name", appName, "namespace", argoNamespace)
+
+	// 2. Delete target Namespace
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: targetNamespace,
+		},
+	}
+	if err := r.Delete(ctx, ns); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to delete target Namespace during finalization", "namespace", targetNamespace)
+		return err
+	}
+	log.Info("Successfully deleted target Namespace during finalization", "namespace", targetNamespace)
+
+	// 3. Post GitHub PR cleanup comment
+	if r.GHClient != nil {
+		comment := fmt.Sprintf("### 🧹 Preview Environment Cleanup Complete\n\n"+
+			"All preview resources for PR #%d have been completely torn down.\n\n"+
+			"- **ArgoCD Application**: `%s` (Deleted)\n"+
+			"- **Target Namespace**: `%s` (Deleted)",
+			env.Spec.PRNumber, appName, targetNamespace)
+		if err := r.GHClient.PostPRComment(ctx, env.Spec.RepoOwner, env.Spec.RepoName, env.Spec.PRNumber, comment); err != nil {
+			log.Error(err, "Failed to post PR teardown cleanup comment to GitHub")
+		} else {
+			log.Info("Successfully posted final cleanup comment to GitHub", "pr", env.Spec.PRNumber)
+		}
 	}
 
 	return nil
