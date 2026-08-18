@@ -336,7 +336,7 @@ func (r *PreviewEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		syncStatus, _, _ := unstructured.NestedString(latestApp.Object, "status", "sync", "status")
 		healthStatus, _, _ := unstructured.NestedString(latestApp.Object, "status", "health", "status")
 
-		if syncStatus == "" {
+		if syncStatus == "" || syncStatus == "Unknown" {
 			syncStatus = "Synced"
 		}
 		if healthStatus == "" {
